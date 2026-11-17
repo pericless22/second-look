@@ -4,7 +4,7 @@ export type RiskLevel = (typeof RISK_LEVELS)[number];
 export const SCAM_TYPES = [
   'delivery', 'bank_impersonation', 'government_impersonation', 'family_impersonation',
   'investment', 'loan', 'prize_or_refund', 'romance', 'job', 'account_takeover',
-  'none', 'other',
+  'marketplace', 'none', 'other',
 ] as const;
 export type ScamType = (typeof SCAM_TYPES)[number];
 

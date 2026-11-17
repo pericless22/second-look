@@ -71,6 +71,20 @@ test('buildPrompt carries signals, language, masking note and the OTP rule', () 
   assert.match(withImage, /\(see screenshot\)/);
 });
 
+test('buildPrompt states score bands, medium cases and the family_impersonation definition', () => {
+  const p = buildPrompt(input(), 'en', false);
+  assert.match(p, /low 0-34, medium 35-69, high 70-100/);
+  assert.match(p, /second-hand trade asking to pay first/);
+  assert.match(p, /family_impersonation means ONLY someone claiming to be the reader's parent or child/);
+  assert.match(p, /scam_type marketplace/);
+});
+
+test('marketplace is a valid scam type and normalizeVerdict accepts it', () => {
+  assert.ok((SCAM_TYPES as readonly string[]).includes('marketplace'));
+  const v = normalizeVerdict({ risk_score: 55, risk_level: 'medium', scam_type: 'marketplace', reasons: ['a'], actions: ['b'], confidence: 0.7 });
+  assert.equal(v.scam_type, 'marketplace');
+});
+
 test('applyLocalFloor lifts an under-scored model verdict when a critical signal fired', () => {
   const signals = [{ id: 'otp_forward', weight: 60, critical: true }];
   const v = applyLocalFloor(lowVerdict, signals, 'en');
