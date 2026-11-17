@@ -25,8 +25,9 @@ Every result shows a badge with where inference actually ran (`response.inferenc
 - **On-device PII masking** (`src/pii.ts`, pure regex, no network): Korean RRN, card numbers, phone numbers (KR/US/intl), bank accounts, emails → `[PHONE_1]`, `[ACCOUNT_1]`…
 - **Link analysis on-device**: shortened links, raw IPs, punycode look-alikes, high-risk TLDs, brand impersonation (e.g. `usps-redelivery-fee.top`).
 - Local red-flag rules in English and Korean (urgency, money/credential requests, family/authority impersonation, delivery/prize/loan/investment lures, obituary/wedding-link lures…).
+- **Verification-code (OTP) forwarding** is a critical signal: "I sent my code to your number by mistake, can you forward it?" has no link and no money request, so it gets a dedicated rule that scores high on its own, and acts as a floor under the model's verdict (`applyLocalFloor`). Official notices ("Your code is 482913. Do not share it.") stay low.
 - Screenshot input (PNG/JPEG) on-device. Screenshots can't be auto-masked, so the cloud path warns before sending.
-- English + Korean UI, large-text mode, "copy summary for family".
+- English + Korean UI, large-text mode, light/dark theme, keyboard shortcuts (Ctrl+Enter), "copy summary for family".
 - 30 **synthetic** test messages (15 EN, 15 KO) in `src/samples.ts`.
 - Firebase **App Check** (reCAPTCHA v3 + debug token for judging) and **Remote Config** (swap the cloud model without redeploying).
 
@@ -34,10 +35,15 @@ Every result shows a badge with where inference actually ran (`response.inferenc
 ```bash
 npm install
 npm run dev          # http://localhost:5173 runs in MOCK MODE until you add a Firebase config
-npm test             # PII masking + 30-sample rules baseline
+npm test             # PII masking, scam rules (incl. OTP forwarding), verdict parsing, mock engine, i18n, 30-sample baseline
+npm run typecheck
 npm run build        # production build to dist/
 ```
-**Mock mode** (`?mock` or no config) demos the whole UI without Firebase or Gemini Nano: results come from local rules, clearly labelled MOCK, and a "Simulate device" selector switches between Nano available / no model / offline.
+**Mock mode** (`?mock` or no config) demos the whole UI without Firebase or Gemini Nano: results come from local rules, clearly labelled MOCK, and a "Simulate device" selector switches between Nano available / no model / offline. The Firebase SDK is not even downloaded in mock mode.
+
+Demo URL parameters (mock mode): `?lang=en|ko`, `?sample=en11` (prefill a sample), `?auto=1` (check immediately), `?sim=unavailable|offline`.
+
+![Verification-code forwarding scored as high risk](docs/screenshots/05-en-otp-forwarding.png)
 
 ### Connect Firebase (real hybrid inference)
 1. Create a Firebase project, add a **Web app**, enable **Firebase AI Logic** (Gemini Developer API) in the console (or `npx firebase-tools init ailogic`).
@@ -48,12 +54,16 @@ npm run build        # production build to dist/
 ## Project structure
 ```
 src/firebase-engine.ts  Firebase AI Logic: getAI + getGenerativeModel with ONLY_ON_DEVICE / PREFER_ON_DEVICE / ONLY_IN_CLOUD, App Check, Remote Config
-src/mock.ts             Mock engine + deterministic rules verdict
+src/engine.ts           Engine interface, prompt, verdict schema + tolerant verdict parsing
+src/mock.ts             Mock engine (simulated device / cloud / offline)
+src/rules.ts            Deterministic rules verdict, risk thresholds, safety floor under model verdicts
 src/pii.ts              On-device PII masking and URL flagging
-src/signals.ts          Local EN/KO scam red-flag rules
+src/signals.ts          Local EN/KO scam red-flag rules (incl. OTP-forwarding detection)
 src/lang.ts             Language routing (Chrome LanguageDetector + Hangul check)
 src/main.ts             UI and routing/consent flow
 src/samples.ts          30 synthetic test messages
+src/i18n.ts             EN/KO strings
+scripts/screenshot.mjs  Regenerates docs/screenshots (needs `npm run dev` + local Chrome; `CHROME_PATH`, `BASE_URL`)
 tests/                  node:test unit tests
 ```
 

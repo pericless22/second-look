@@ -1,57 +1,56 @@
 // Mock engine: lets the full UI be demoed without a Firebase project or Gemini Nano.
-// Scores with the same local signals; clearly labelled "MOCK" in the UI.
+// Scores with the same local rules; clearly labelled "MOCK" in the UI.
 import type { Engine, CheckInput, OnDeviceStatus } from './engine.ts';
 import type { CheckResult, Source, Verdict } from './types.ts';
-import type { Signal } from './signals.ts';
-import { guessScamType } from './signals.ts';
+import { rulesVerdict } from './rules.ts';
 import { t } from './i18n.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** Deterministic verdict from local signals only (mock mode, and when the user keeps it on-device without a model). */
-export function rulesVerdict(signals: Signal[], outLang: string): Verdict {
-  const ids = signals.map((s) => s.id);
-  const score = Math.min(98, signals.reduce((a, s) => a + s.weight, ids.length ? 12 : 4));
-  const level = score >= 70 ? 'high' : score >= 35 ? 'medium' : 'low';
-  const L = (k: string) => t(outLang, k);
-  const reasons = signals.slice().sort((a, b) => b.weight - a.weight).slice(0, 4).map((s) => L(`sig.${s.id}`));
-  const actions = level === 'low' ? [L('act.low1')] : [L('act.noclick'), L('act.verify'), L('act.report'), ...(level === 'high' ? [L('act.block')] : [])];
-  return {
-    risk_score: score, risk_level: level, scam_type: level === 'low' ? 'none' : guessScamType(ids),
-    reasons: reasons.length ? reasons : [L('sig.none')], actions, confidence: level === 'medium' ? 0.55 : 0.85,
-  };
-}
+const browserOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
 
 export class MockEngine implements Engine {
-  kind = 'mock' as const;
+  readonly kind = 'mock' as const;
+  /** Simulated on-device model state ("Simulate device" selector). */
   status: OnDeviceStatus = 'available';
-  uiLang = 'en';
+  /** Simulated network state. */
   offline = false;
 
+  /** `delayScale: 0` removes the simulated latency (tests). */
+  private delayScale: number;
+  constructor(delayScale = 1) { this.delayScale = delayScale; }
+
   async onDeviceStatus() { return this.status; }
+
   async downloadOnDevice(onProgress: (p: number) => void) {
     this.status = 'downloading';
-    for (let i = 1; i <= 10; i++) { await sleep(120); onProgress(i / 10); }
+    for (let i = 1; i <= 10; i++) { await sleep(120 * this.delayScale); onProgress(i / 10); }
     this.status = 'available';
   }
+
   private async run(input: CheckInput, source: Source, outLang: string): Promise<CheckResult> {
     const t0 = performance.now();
-    await sleep(source.includes('cloud') ? 900 : 450);
+    await sleep((source === 'mock_in_cloud' ? 900 : 450) * this.delayScale);
     return { verdict: rulesVerdict(input.signals, outLang), source, sentText: input.text, ms: Math.round(performance.now() - t0) };
   }
+
   async privateCheck(input: CheckInput) {
     if (this.status !== 'available') throw new Error('on-device model unavailable');
+    // Like Gemini Nano today, the simulated on-device path answers in English.
     return this.run(input, 'mock_on_device', 'en');
   }
+
   async hybridCheck(input: CheckInput) {
     return this.status === 'available' ? this.run(input, 'mock_on_device', 'en') : this.cloudCheck(input);
   }
+
   async cloudCheck(input: CheckInput) {
-    if (this.offline || !navigator.onLine) throw new Error('offline');
-    return this.run(input, 'mock_in_cloud', this.uiLang);
+    if (this.offline || browserOffline()) throw new Error('offline');
+    return this.run(input, 'mock_in_cloud', input.outLang);
   }
-  async followUp(_m: string, v: Verdict, q: string, uiLang: string) {
-    await sleep(700);
-    return t(uiLang, 'mock.followup').replace('{q}', q).replace('{score}', String(v.risk_score));
+
+  async followUp(_maskedMessage: string, v: Verdict, question: string, uiLang: string) {
+    if (this.offline || browserOffline()) throw new Error('offline');
+    await sleep(700 * this.delayScale);
+    return t(uiLang, 'mock.followup').replace('{q}', question).replace('{score}', String(v.risk_score));
   }
 }

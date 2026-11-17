@@ -14,7 +14,7 @@ export const SAMPLES: Sample[] = [
   { id: 'en08', lang: 'en', expected: 'scam', label: 'Job offer easy money', text: 'Remote job offer! Like YouTube videos and earn $300 per day. Work from home, no experience. Message our recruiter on WhatsApp +1 555 0199 2231 to start today.' },
   { id: 'en09', lang: 'en', expected: 'scam', label: 'Tech support remote access', text: 'Microsoft Security: Your PC is infected with 3 viruses. Call support now at 1-555-0142-889 and install AnyDesk so our technician can fix it remotely.' },
   { id: 'en10', lang: 'en', expected: 'scam', label: 'Prize winner', text: 'Congratulations! You are the winner of our Amazon loyalty prize: a new iPhone 18. Pay $4.95 shipping to claim: amazon-rewards-claim.click' },
-  { id: 'en11', lang: 'en', expected: 'suspicious', label: 'OTP code request', text: "Hey, I accidentally sent my verification code to your number. Could you forward me the 6-digit code you just received? Thanks!" },
+  { id: 'en11', lang: 'en', expected: 'scam', label: 'Verification code forwarding', text: "Hey, I accidentally sent my verification code to your number. Could you forward me the 6-digit code you just received? Thanks!" },
   { id: 'en12', lang: 'en', expected: 'suspicious', label: 'Wrong number romance opener', text: "Hi Jessica, is this still your number? It's David from the golf club. Oh sorry, wrong number! You seem nice though, where are you from?" },
   { id: 'en13', lang: 'en', expected: 'safe', label: 'Family dinner', text: "Hi mom, running 10 min late, save me some dinner! See you at 7." },
   { id: 'en14', lang: 'en', expected: 'safe', label: 'Pharmacy ready', text: 'Your prescription is ready for pickup at the pharmacy on Main St. Reply STOP to opt out.' },

@@ -1,8 +1,12 @@
-export type RiskLevel = 'low' | 'medium' | 'high';
-export type ScamType =
-  | 'delivery' | 'bank_impersonation' | 'government_impersonation' | 'family_impersonation'
-  | 'investment' | 'loan' | 'prize_or_refund' | 'romance' | 'job' | 'account_takeover'
-  | 'none' | 'other';
+export const RISK_LEVELS = ['low', 'medium', 'high'] as const;
+export type RiskLevel = (typeof RISK_LEVELS)[number];
+
+export const SCAM_TYPES = [
+  'delivery', 'bank_impersonation', 'government_impersonation', 'family_impersonation',
+  'investment', 'loan', 'prize_or_refund', 'romance', 'job', 'account_takeover',
+  'none', 'other',
+] as const;
+export type ScamType = (typeof SCAM_TYPES)[number];
 
 export interface Verdict {
   risk_score: number; // 0-100
@@ -13,7 +17,8 @@ export interface Verdict {
   confidence: number; // 0-1
 }
 
-export type Source = 'on_device' | 'in_cloud' | 'mock_on_device' | 'mock_in_cloud';
+/** Where the verdict came from. `rules` = deterministic local rules only (offline / consent declined). */
+export type Source = 'on_device' | 'in_cloud' | 'mock_on_device' | 'mock_in_cloud' | 'rules';
 
 export interface CheckResult {
   verdict: Verdict;

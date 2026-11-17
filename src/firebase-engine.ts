@@ -7,8 +7,9 @@ import {
   type GenerativeModel, type Part,
 } from 'firebase/ai';
 import type { Engine, CheckInput, OnDeviceStatus } from './engine.ts';
-import { buildPrompt, normalizeVerdict, VERDICT_JSON_SCHEMA, RISK_ENUM, SCAM_ENUM } from './engine.ts';
-import type { CheckResult, Source, Verdict } from './types.ts';
+import { buildPrompt, normalizeVerdict, VERDICT_JSON_SCHEMA } from './engine.ts';
+import { applyLocalFloor } from './rules.ts';
+import { RISK_LEVELS, SCAM_TYPES, type CheckResult, type Source, type Verdict } from './types.ts';
 
 export interface AppConfig {
   firebase: FirebaseOptions;
@@ -19,8 +20,8 @@ export interface AppConfig {
 const CLOUD_SCHEMA = Schema.object({
   properties: {
     risk_score: Schema.integer(),
-    risk_level: Schema.enumString({ enum: RISK_ENUM }),
-    scam_type: Schema.enumString({ enum: SCAM_ENUM }),
+    risk_level: Schema.enumString({ enum: [...RISK_LEVELS] }),
+    scam_type: Schema.enumString({ enum: [...SCAM_TYPES] }),
     reasons: Schema.array({ items: Schema.string() }),
     actions: Schema.array({ items: Schema.string() }),
     confidence: Schema.number(),
@@ -28,7 +29,7 @@ const CLOUD_SCHEMA = Schema.object({
 });
 
 export class FirebaseEngine implements Engine {
-  kind = 'firebase' as const;
+  readonly kind = 'firebase' as const;
   private ai;
   private cloudModelName: string;
   private cache = new Map<string, GenerativeModel>();
@@ -102,13 +103,16 @@ export class FirebaseEngine implements Engine {
     const parts: (string | Part)[] = [buildPrompt(input, outLang, masked)];
     if (input.image) parts.push({ type: 'inlineData', inlineData: { mimeType: input.image.mimeType, data: input.image.base64 } });
     const res = await this.model(mode, input.lang, !!input.image).generateContent(parts);
-    const src: Source = res.response.inferenceSource === 'on_device' ? 'on_device' : 'in_cloud';
-    return { verdict: normalizeVerdict(res.response.text()), source: src, sentText: input.text, ms: Math.round(performance.now() - t0) };
+    const source: Source = res.response.inferenceSource === 'on_device' ? 'on_device' : 'in_cloud';
+    // Local critical signals (e.g. a request to forward a verification code) act as a floor under the model.
+    const verdict = applyLocalFloor(normalizeVerdict(res.response.text()), input.signals, outLang);
+    return { verdict, source, sentText: input.text, ms: Math.round(performance.now() - t0) };
   }
 
+  // The on-device model only writes English for now, so paths that may run on-device ask for English.
   privateCheck(input: CheckInput) { return this.run(InferenceMode.ONLY_ON_DEVICE, input, 'en', false); }
   hybridCheck(input: CheckInput) { return this.run(InferenceMode.PREFER_ON_DEVICE, input, 'en', true); }
-  cloudCheck(input: CheckInput) { return this.run(InferenceMode.ONLY_IN_CLOUD, input, uiLangOf(input), true); }
+  cloudCheck(input: CheckInput) { return this.run(InferenceMode.ONLY_IN_CLOUD, input, input.outLang, true); }
 
   async followUp(maskedMessage: string, v: Verdict, question: string, uiLang: string) {
     const chat = getGenerativeModel(this.ai, { mode: InferenceMode.ONLY_IN_CLOUD, inCloudParams: { model: this.cloudModelName } })
@@ -122,7 +126,3 @@ export class FirebaseEngine implements Engine {
     return r.response.text();
   }
 }
-
-let currentUiLang = 'en';
-export function setEngineUiLang(l: string) { currentUiLang = l; }
-function uiLangOf(_i: CheckInput) { return currentUiLang; }
