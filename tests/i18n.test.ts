@@ -17,8 +17,9 @@ test('every signal, scam type, risk level and source has a label', () => {
     'sig.none',
     ...SCAM_TYPES.map((s) => `type.${s}`),
     ...RISK_LEVELS.map((l) => `result.level.${l}`),
-    ...['on_device', 'in_cloud', 'mock_on_device', 'mock_in_cloud', 'rules'].map((s) => `result.source.${s}`),
-    ...['RRN', 'CARD', 'PHONE', 'ACCOUNT', 'EMAIL'].map((p) => `pii.${p}`),
+    ...['on_device', 'in_cloud', 'in_cloud_image', 'mock_on_device', 'mock_in_cloud', 'mock_in_cloud_image', 'in_cloud_screenshot', 'mock_in_cloud_screenshot', 'rules'].map((s) => `result.source.${s}`),
+    ...['RRN', 'CARD', 'PHONE', 'ACCOUNT', 'EMAIL', 'ID', 'CODE'].map((p) => `pii.${p}`),
+    ...['network', 'quota', 'denied', 'too_long', 'model'].map((e) => `err.${e}`),
   ];
   for (const k of keys) for (const lang of ['en', 'ko']) assert.ok(k in DICTS[lang], `${lang} is missing ${k}`);
 });

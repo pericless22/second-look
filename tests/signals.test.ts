@@ -86,3 +86,47 @@ test('guessScamType priority', () => {
   assert.equal(guessScamType(['wrong_number_opener']), 'romance');
   assert.equal(guessScamType(['job_easy_money', 'off_platform_contact']), 'job');
 });
+
+test('userinfo_trick is a known URL signal', async () => {
+  const { SIGNAL_IDS } = await import('../src/signals.ts');
+  assert.ok(SIGNAL_IDS.includes('url_userinfo_trick'));
+  assert.ok(verdictFor('http://paypal.com@evil.top/login').ids.includes('url_userinfo_trick'));
+});
+
+// English rules need word boundaries: ordinary messages must stay quiet.
+const ORDINARY: [string, string[]][] = [
+  ["I won't be home first thing, call the bank", ['impersonation_authority', 'prize_refund']],
+  ['My wireless earbuds arrived', ['money_request']],
+  ['Meeting moved to 2026-11-20 at 3pm', ['contains_account_number']],
+  ['The first thing we need is a courtesy call', ['impersonation_authority']],
+  ['We won the game last night!', []],
+  ["She won't mind", ['prize_refund']],
+  ['Wireless charging is great', ['money_request']],
+  ['Pineapple pizza at 7?', ['url_brand_impersonation']],
+  ['The council meets at 5', ['impersonation_authority']],
+  ['Lunch at noon, bring wireless mouse', ['money_request']],
+  ['I visited the bank yesterday', []],
+  ['Banking apps are handy', []],
+];
+
+for (const [text, banned] of ORDINARY) {
+  test(`ordinary message stays quiet: ${text}`, () => {
+    const { ids, verdict } = verdictFor(text);
+    for (const b of banned) assert.ok(!ids.includes(b), `${b} fired for: ${text}`);
+    assert.ok(verdict.risk_score < 35, `score ${verdict.risk_score}`);
+  });
+}
+
+test('word boundaries keep real matches working', () => {
+  assert.ok(verdictFor('Please wire the money to this bank').ids.includes('money_request'));
+  assert.ok(verdictFor('This is the IRS calling').ids.includes('impersonation_authority'));
+  assert.ok(verdictFor('You won a prize!').ids.includes('prize_refund'));
+  assert.ok(verdictFor('Your banking account is locked').ids.includes('impersonation_bank'));
+});
+
+test('past-tense money and refund words still count', () => {
+  const ids = (t: string) => localSignals(t, maskPII(t)).map((s) => s.id);
+  assert.ok(ids('Your payment was transferred to the wrong account').includes('money_request'));
+  assert.ok(ids('You will be refunded once you confirm').includes('prize_refund'));
+  assert.ok(ids('The amount deposited is pending').includes('money_request'));
+});
