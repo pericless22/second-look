@@ -130,3 +130,8 @@ dialog p { margin: 8px 0; }
 
 footer { margin-top: 28px; color: var(--muted); font-size: .8em; text-align: center; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition: none !important; } }
+.banner.loud { font-size: 1.05em; font-weight: 600; border-width: 2px; padding: 14px 16px; background: var(--high-bg, var(--mock-bg)); color: var(--high, var(--mock)); }
+.banner small { font-weight: 400; opacity: .85; }
+p.small { font-size: .85em; }
+.answer p.muted { margin: 0 0 4px; }
+details.muted { margin-top: 6px; font-size: .9em; }

@@ -1,29 +1,31 @@
-import { maskPII, type MaskResult } from './pii.ts';
-import { localSignals, type Signal } from './signals.ts';
-import { detectLanguage, supportedOnDevice } from './lang.ts';
+import type { MaskResult } from './pii.ts';
+import type { Signal } from './signals.ts';
+import { detectLanguage } from './lang.ts';
 import { t } from './i18n.ts';
 import { SAMPLES } from './samples.ts';
-import type { Engine, ImageInput, OnDeviceStatus } from './engine.ts';
+import type { Engine, FollowUpChat, ImageInput, OnDeviceStatus } from './engine.ts';
 import { MockEngine } from './mock.ts';
 import { defaultActions, rulesVerdict } from './rules.ts';
+import { friendlyError, MAX_TEXT_CHARS, maskQuestion, runCheck, secondOpinion, type CloudWhy, type Route } from './route.ts';
+import { isLocalHost, loadConfig } from './config.ts';
 import type { CheckResult, RiskLevel } from './types.ts';
 
 // ---------- state ----------
-/** How the last result was produced; rendered as the privacy note under the score. */
-type Route =
-  | { kind: 'private' }
-  | { kind: 'cloud'; why: 'lang' | 'nomodel' | 'second' }
-  | { kind: 'declined' }
-  | { kind: 'offline' };
-
 /** Everything needed to re-render (or re-check) the last result, frozen at check time. */
 interface Checked {
   result: CheckResult;
   mask: MaskResult;
   signals: Signal[];
-  lang: string;
+  lang: string | null;
   image?: ImageInput;
+  /** How the result was produced; rendered as the privacy note under the score. */
   route: Route;
+  /** The on-device verdict a cloud second opinion was asked about, kept visible beside it. */
+  previous?: CheckResult;
+  /** Follow-up conversation about this result (one session, so it remembers earlier questions). */
+  chat?: FollowUpChat;
+  /** Questions and answers so far, re-rendered after a language switch. */
+  qa?: { q: string; a: string }[];
 }
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -46,23 +48,28 @@ const list = (items: string[]) => `<ul>${items.map((x) => `<li>${esc(x)}</li>`).
 
 const mock = () => (engine instanceof MockEngine ? engine : undefined);
 const online = () => navigator.onLine && !mock()?.offline;
-const errorText = (e: unknown) => {
-  const msg = e instanceof Error ? e.message : String(e);
-  return msg === 'offline' ? L('err.offline') : `${L('err')}: ${msg}`;
-};
+const errorText = (e: unknown) => L(friendlyError(e));
+
+/** Mock mode on a deployed build means the config was missing: say so loudly, not just in a corner. */
+const unexpectedMock = () => !!mock() && !params.has('mock') && !isLocalHost(location.hostname);
 
 async function loadEngine(): Promise<Engine> {
   if (params.has('mock')) return new MockEngine();
+  const toMock = (reason: string) => {
+    console.warn(`[Second Look] MOCK MODE: ${reason}. Nothing in this session calls Gemini.`);
+    const m = new MockEngine();
+    m.reason = reason;
+    return m;
+  };
+  const loaded = await loadConfig(fetch);
+  if (!loaded.ok) return toMock(loaded.reason);
   try {
-    const r = await fetch('/firebase-config.json', { cache: 'no-store' });
-    if (!r.ok) throw new Error('no config');
-    const cfg = await r.json();
-    if (!cfg?.firebase?.apiKey || String(cfg.firebase.apiKey).startsWith('YOUR_')) throw new Error('placeholder config');
     // Loaded lazily so mock mode never downloads the Firebase SDK.
     const { FirebaseEngine } = await import('./firebase-engine.ts');
-    return new FirebaseEngine(cfg);
-  } catch {
-    return new MockEngine();
+    return new FirebaseEngine(loaded.cfg);
+  } catch (e) {
+    console.error('[Second Look] Firebase failed to start:', e);
+    return toMock(`Firebase failed to start (${e instanceof Error ? e.message : String(e)})`);
   }
 }
 
@@ -86,7 +93,7 @@ function renderShell() {
         <button class="ghost" id="large" title="${esc(L('a11y.large'))}" aria-label="${esc(L('a11y.large'))}" aria-pressed="${document.body.classList.contains('large')}">A+</button>
       </div>
     </header>
-    ${m ? `<div class="banner" role="note"><span>⚠️ ${L('status.mock')}</span>
+    ${m ? `<div class="banner${unexpectedMock() ? ' loud' : ''}" role="${unexpectedMock() ? 'alert' : 'note'}"><span>⚠️ ${L(unexpectedMock() ? 'status.mock_deployed' : 'status.mock')}${m.reason ? ` <small>(${esc(m.reason)})</small>` : ''}</span>
       <label>${L('mock.sim')}:
       <select id="sim"><option value="available">${L('mock.sim.available')}</option><option value="unavailable">${L('mock.sim.unavailable')}</option><option value="offline">${L('status.offline')}</option></select></label></div>` : ''}
     <p class="sub">${L('app.sub')}</p>
@@ -94,7 +101,7 @@ function renderShell() {
     <main class="grid">
       <section class="card">
         <label class="h" for="msg">${L('input.label')}</label>
-        <textarea id="msg" placeholder="${esc(L('input.placeholder'))}" aria-describedby="hint"></textarea>
+        <textarea id="msg" placeholder="${esc(L('input.placeholder'))}" aria-describedby="hint" maxlength="${MAX_TEXT_CHARS}"></textarea>
         <div class="row">
           <label class="file muted">📎 ${L('input.image')} <input type="file" id="img" accept="${IMAGE_TYPES.join(',')}" /></label>
           <span id="thumb"></span>
@@ -103,7 +110,7 @@ function renderShell() {
           <select id="samples" aria-label="${esc(L('input.samples'))}"><option value="">${L('input.samples')} (${SAMPLES.length})</option>${SAMPLES.map((s) => `<option value="${s.id}">${s.lang.toUpperCase()} · ${esc(s.label)}</option>`).join('')}</select>
         </div>
         <div class="row">
-          <button class="primary" id="check">🔒 ${L('btn.check')}</button>
+          <button class="primary" id="check">🔍 ${L('btn.check')}</button>
           <button class="ghost" id="clear">${L('btn.clear')}</button>
           <span class="muted hint" id="hint">${L('input.hint')}</span>
         </div>
@@ -125,6 +132,8 @@ function renderShell() {
     uiLang = b.dataset.lang === 'ko' ? 'ko' : 'en';
     relocalizeLast();
     renderShell();
+    // The page is rebuilt, so put keyboard focus back on the language switch.
+    maybe<HTMLButtonElement>(`[data-lang="${uiLang}"]`)?.focus();
   }));
   $('#large').addEventListener('click', () => {
     const on = document.body.classList.toggle('large');
@@ -224,79 +233,83 @@ async function check() {
     $('#msg').focus();
     return;
   }
+  if (text.length > MAX_TEXT_CHARS) {
+    showInputError(L('input.too_long').replace('{max}', String(MAX_TEXT_CHARS)));
+    return;
+  }
   showInputError('');
   btn.disabled = true;
   last = undefined;
   renderBusy('status.checking');
   try {
-    const mask = maskPII(text);
-    const signals = localSignals(text, mask);
-    const lang = text ? await detectLanguage(text) : 'en';
+    const out = await runCheck(text, img, {
+      engine,
+      online,
+      uiLang,
+      detectLanguage,
+      askConsent: (mask, why, lang, withImage) => { renderEmpty(); return askConsent(mask, cloudReason(why, lang), withImage); },
+      onCloudStart: () => renderBusy('status.checking.cloud'),
+    });
     status = await engine.onDeviceStatus(!!img);
-    const langOk = supportedOnDevice(lang);
-    const done = (result: CheckResult, route: Route) => { last = { result, mask, signals, lang, image: img, route }; renderResult(); };
-    // Without a model nothing can read a screenshot, so never report "looks OK" for one.
-    const rulesFallback = (route: Route) => (text ? done(rulesOnly(text, signals), route) : renderEmpty(`⚠️ ${L('err.image_rules')}`));
-
-    // 1) Private path: raw text, ONLY_ON_DEVICE. Never leaves the device.
-    if (status === 'available' && langOk) {
-      return done(await engine.privateCheck({ text, image: img, lang, outLang: uiLang, signals }), { kind: 'private' });
+    if (!out.result) {
+      // A screenshot with no text and no model: nothing can read it, so never report "looks OK".
+      const r = out.route;
+      // Mock mode never sends anything, so it doesn't claim the screenshot went out.
+      const why = r.kind === 'failed' ? `${L(r.error)} ${r.attempted === 'cloud' && !mock() ? L('route.failed_sent_image') + ' ' : ''}` : '';
+      return renderEmpty(`⚠️ ${esc(why)}${L('err.image_rules')}`);
     }
-    // 2) No model and no network: deterministic local rules only.
-    if (!online()) return rulesFallback({ kind: 'offline' });
-
-    // 3) Needs the cloud: ask consent, showing exactly the masked text that would be sent.
-    const why = langOk ? 'nomodel' : 'lang';
-    renderEmpty();
-    if (!(await askConsent(mask, cloudReason(why, lang), !!img))) return rulesFallback({ kind: 'declined' });
-    renderBusy('status.checking.cloud');
-    const input = { text: mask.masked, image: img, lang, outLang: uiLang, signals };
-    done(langOk ? await engine.hybridCheck(input) : await engine.cloudCheck(input), { kind: 'cloud', why });
+    last = { result: out.result, mask: out.mask, signals: out.signals, lang: out.lang, image: img, route: out.route };
+    renderResult();
   } catch (e) {
+    console.error(e);
     renderEmpty(`⚠️ ${esc(errorText(e))}`);
   } finally {
     btn.disabled = false;
   }
 }
 
-function rulesOnly(text: string, signals: Signal[]): CheckResult {
-  return { verdict: rulesVerdict(signals, uiLang), source: 'rules', sentText: text, ms: 0 };
-}
-
 /** Rule-based verdict text is generated locally, so it can follow a UI language switch. */
 function relocalizeLast() {
   if (!last) return;
   const { source } = last.result;
-  if (source === 'rules' || source === 'mock_in_cloud') last.result.verdict = rulesVerdict(last.signals, uiLang);
+  if (source === 'rules' || source === 'mock_in_cloud') {
+    last.result.verdict = rulesVerdict(last.signals, uiLang);
+    last.result.lang = uiLang;
+  }
 }
 
-function cloudReason(why: 'lang' | 'nomodel' | 'second', lang: string) {
+function cloudReason(why: CloudWhy, lang: string | null) {
   if (why === 'second') return L('route.second');
   if (why === 'nomodel') return L('route.nomodel');
+  if (why === 'image' || !lang) return L('route.image_only');
   const key = `lang.${lang}`;
   const name = L(key);
   return L('route.lang').replace('{lang}', name === key ? lang.toUpperCase() : name);
 }
 
 function highlightMasked(m: MaskResult) {
-  return esc(m.masked).replace(/\[(RRN|CARD|PHONE|ACCOUNT|EMAIL)_\d+\]/g, (x) => `<span class="mask">${x}</span>`);
+  return esc(m.masked).replace(/\[(RRN|CARD|PHONE|ACCOUNT|EMAIL|ID|CODE)_\d+\]/g, (x) => `<span class="mask">${x}</span>`);
 }
 
 function askConsent(mask: MaskResult, reason: string, withImage: boolean): Promise<boolean> {
   const d = $<HTMLDialogElement>('#consent');
+  const hasText = !!mask.masked;
   const found = mask.findings.length
     ? `<div class="chips">${mask.findings.map((f) => `<span class="chip neutral">${L('pii.' + f.type)} → ${f.token}</span>`).join('')}</div>`
-    : `<span class="muted">${L('consent.none')}</span>`;
+    : `<span class="muted">${L(withImage ? 'consent.none_text' : 'consent.none')}</span>`;
+  // Nothing is scanned in a screenshot, so a screenshot-only dialog shows no "nothing found" reassurance.
+  const findings = hasText ? `<h3>${L('consent.found')}</h3>${found}<p class="muted small">${L('consent.limits')}</p>` : '';
+  const title = !withImage ? 'consent.title' : hasText ? 'consent.title_both' : 'consent.title_image';
   d.innerHTML = `
-    <h2 id="consent-title">☁️ ${L('consent.title')}</h2>
+    <h2 id="consent-title">☁️ ${L(title)}</h2>
     <p class="muted">${esc(reason)}</p>
-    <p>${L('consent.body')}</p>
-    <div class="mono">${highlightMasked(mask) || L('consent.screenshot')}</div>
+    <p>${L(!withImage ? 'consent.body' : hasText ? 'consent.body_image' : 'consent.body_image_only')}</p>
+    <div class="mono" tabindex="0" aria-label="${esc(L('consent.preview'))}">${highlightMasked(mask) || L('consent.screenshot')}</div>
     ${withImage ? `<p class="route warn">⚠️ ${L('route.image')}</p>` : ''}
-    <h3>${L('consent.found')}</h3>${found}
+    ${findings}
     <div class="row end">
       <button id="cno">${L('consent.no')}</button>
-      <button class="primary" id="cyes">${L('consent.yes')}</button>
+      <button class="primary" id="cyes">${L(withImage ? 'consent.yes_image' : 'consent.yes')}</button>
     </div>`;
   d.returnValue = '';
   d.showModal();
@@ -309,12 +322,22 @@ function askConsent(mask: MaskResult, reason: string, withImage: boolean): Promi
 }
 
 function routeNote(c: Checked) {
-  const { route } = c;
+  const { route, result } = c;
+  const onDevice = result.source === 'on_device' || result.source === 'mock_on_device';
   switch (route.kind) {
     case 'private': return `<div class="route">🔒 ${L('route.private')}</div>`;
-    case 'cloud': return `<div class="route cloud">☁️ ${esc(cloudReason(route.why, c.lang))} ${L('route.cloud_note')}</div>`;
+    case 'cloud': {
+      // PREFER_ON_DEVICE may still have run on this device; describe what actually happened.
+      if (onDevice) return `<div class="route">🔒 ${L('route.hybrid_device')}</div>`;
+      const sent = !route.sentImage ? 'route.cloud_note' : c.mask.masked ? 'route.cloud_note_image' : 'route.cloud_note_image_only';
+      return `<div class="route cloud">☁️ ${esc(cloudReason(route.why, c.lang))} ${L(sent)}</div>`;
+    }
     case 'declined': return `<div class="route">🔒 ${L('consent.declined')}</div>`;
     case 'offline': return `<div class="route">📴 ${L('route.offline')}</div>`;
+    case 'failed': {
+      const sent = route.attempted !== 'cloud' ? '' : ` ${L(route.sentImage ? (c.mask.masked ? 'route.failed_sent_both' : 'route.failed_sent_image') : 'route.failed_sent')}`;
+      return `<div class="route warn" role="alert">⚠️ ${esc(L(route.error))} ${L('route.failed')}${sent}</div>`;
+    }
   }
 }
 
@@ -325,17 +348,27 @@ function renderResult(error = '') {
   const v = r.verdict;
   const onDevice = r.source === 'on_device' || r.source === 'mock_on_device';
   const inCloud = r.source === 'in_cloud' || r.source === 'mock_in_cloud';
-  // The on-device model answers in English; show the standard advice in the UI language instead.
-  const translateLocally = onDevice && uiLang !== 'en';
+  // Paths that may run on-device ask for English. When the UI is in another language, lead with the
+  // localized local red flags and standard advice, and keep the model's English notes as secondary.
+  const translateLocally = r.lang === 'en' && uiLang !== 'en';
+  const localReasons = signals.map((s) => L('sig.' + s.id)).slice(0, 4);
   const actions = translateLocally || !v.actions.length ? defaultActions(v.risk_level, signals, uiLang) : v.actions;
-  const reasons = v.reasons.length ? v.reasons : signals.map((s) => L('sig.' + s.id)).slice(0, 4);
+  const reasons = translateLocally ? (localReasons.length ? localReasons : v.reasons) : v.reasons.length ? v.reasons : localReasons;
+  const modelNotes = translateLocally && localReasons.length && v.reasons.length
+    ? `<details class="muted"><summary>${L('result.model_notes')}</summary>${list(v.reasons)}</details>` : '';
+  const sourceKey = inCloud && c.route.kind === 'cloud' && c.route.sentImage ? `${r.source}_${mask.masked ? 'image' : 'screenshot'}` : r.source;
+  const prev = c.previous;
+  const previous = prev
+    ? `<p class="muted">${L('result.previous').replace('{score}', String(prev.verdict.risk_score)).replace('{level}', L('result.level.' + prev.verdict.risk_level))}</p>` : '';
   const localFlags = signals.length
     ? `<div class="chips">${signals.map((s) => `<span class="chip">${esc(L('sig.' + s.id))}</span>`).join('')}</div>`
     : `<span class="muted">${L('sig.none')}</span>`;
   const links = mask.urls.length
     ? `<h3>${L('result.links')}</h3><ul class="links">${mask.urls.map((u) => `<li><code>${esc(u.host)}</code> ${u.flags.map((f) => `<span class="chip">${L('flag.' + f)}</span>`).join(' ')}</li>`).join('')}</ul>`
     : '';
-  const showSecond = c.route.kind === 'private' && online() && (v.risk_level === 'medium' || v.confidence < 0.6);
+  // Offer the cloud when the on-device verdict is unsure, or when the on-device model failed.
+  const deviceFailed = c.route.kind === 'failed' && c.route.attempted === 'device';
+  const showSecond = online() && ((c.route.kind === 'private' && (v.risk_level === 'medium' || v.confidence < 0.6)) || deviceFailed);
   const sourceIcon = onDevice ? '📱' : inCloud ? '☁️' : '📏';
 
   $('#result').innerHTML = `
@@ -343,22 +376,24 @@ function renderResult(error = '') {
       <div class="gauge" role="img" aria-label="${esc(L('a11y.score').replace('{score}', String(v.risk_score)))}" style="--v:${v.risk_score}"><span>${v.risk_score}</span></div>
       <div>
         <div class="level">${LEVEL_ICON[v.risk_level]} ${L('result.level.' + v.risk_level)}</div>
-        <div class="muted">${L('result.type')}: ${L('type.' + v.scam_type)} · ${L('result.confidence')} ${Math.round(v.confidence * 100)}%</div>
-        <div class="badges"><span class="badge b-${r.source}">${sourceIcon} ${L('result.source.' + r.source)}</span>${r.ms ? `<span class="muted">${r.ms} ms</span>` : ''}</div>
+        <div class="muted">${L('result.type')}: ${L('type.' + v.scam_type)}${r.source === 'rules' ? '' : ` · ${L('result.confidence')} ${Math.round(v.confidence * 100)}%`}</div>
+        <div class="badges"><span class="badge b-${r.source}">${sourceIcon} ${L('result.source.' + sourceKey)}</span>${r.ms ? `<span class="muted">${r.ms} ms</span>` : ''}</div>
       </div>
     </div>
     ${routeNote(c)}
+    ${previous}
     <h3>${L('result.reasons')}</h3>${list(reasons)}
+    ${modelNotes}
     ${translateLocally ? `<p class="muted">ℹ️ ${L('result.ondevice_en')}</p>` : ''}
     <h3>${L('result.actions')}</h3>${list(actions)}
     <h3>${L('result.localflags')}</h3>${localFlags}
     ${links}
     <div class="row actions">
-      ${showSecond ? `<button id="second">☁️ ${L('result.second')}</button>` : ''}
+      ${showSecond ? `<button id="second">☁️ ${L(deviceFailed ? 'result.cloud_instead' : 'result.second')}</button>` : ''}
       <button id="share">📋 ${L('result.share')}</button>
     </div>
     ${error ? `<p class="inline-error" role="alert">⚠️ ${esc(error)}</p>` : ''}
-    ${inCloud ? `<h3><label for="q">${L('follow.title')}</label></h3><div class="follow"><input id="q" placeholder="${esc(L('follow.placeholder'))}" /><button id="ask">${L('follow.ask')}</button></div><div id="ans" aria-live="polite"></div>` : ''}`;
+    ${inCloud ? `<h3><label for="q">${L('follow.title')}</label></h3><div id="ans" aria-live="polite">${(c.qa ?? []).map(qaHtml).join('')}</div><div class="follow"><input id="q" placeholder="${esc(L('follow.placeholder'))}" maxlength="500" /><button id="ask">${L('follow.ask')}</button></div>` : ''}`;
 
   const share = $('#share');
   share.addEventListener('click', async () => {
@@ -377,8 +412,8 @@ function renderResult(error = '') {
     second.disabled = true;
     renderBusy('status.checking.cloud');
     try {
-      const result = await engine.cloudCheck({ text: mask.masked, image: c.image, lang: c.lang, outLang: uiLang, signals });
-      last = { ...c, result, route: { kind: 'cloud', why: 'second' } };
+      const result = await secondOpinion(engine, c, uiLang);
+      last = { ...c, result, previous: deviceFailed ? undefined : c.result, chat: undefined, qa: undefined, route: { kind: 'cloud', why: 'second', sentImage: !!c.image } };
       renderResult();
     } catch (e) {
       last = c;
@@ -394,11 +429,18 @@ function renderResult(error = '') {
       if (!question || ask.disabled) return;
       ask.disabled = true;
       try {
-        // The question is masked too: people often paste the number they were told to call.
-        const answer = await engine.followUp(mask.masked, v, maskPII(question).masked, uiLang);
-        $('#ans').innerHTML = `<div class="answer">${esc(answer)}</div>`;
+        // One chat per result, so a second question can build on the first answer.
+        c.chat ??= engine.startFollowUp({ maskedMessage: mask.masked, verdict: v, uiLang });
+        const q2 = maskQuestion(question);
+        const answer = await c.chat.ask(q2);
+        (c.qa ??= []).push({ q: q2, a: answer });
+        maybe('#ans .inline-error')?.remove();
+        maybe('#ans')?.insertAdjacentHTML('beforeend', qaHtml({ q: q2, a: answer }));
+        q.value = '';
       } catch (e) {
-        $('#ans').innerHTML = `<p class="inline-error" role="alert">⚠️ ${esc(errorText(e))}</p>`;
+        console.warn('Follow-up failed:', e);
+        maybe('#ans .inline-error')?.remove();
+        maybe('#ans')?.insertAdjacentHTML('beforeend', `<p class="inline-error" role="alert">⚠️ ${esc(errorText(e))}</p>`);
       } finally {
         ask.disabled = false;
       }
@@ -406,6 +448,10 @@ function renderResult(error = '') {
     ask.addEventListener('click', send);
     q.addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
   }
+}
+
+function qaHtml({ q, a }: { q: string; a: string }) {
+  return `<div class="answer"><p class="muted">${esc(q)}</p>${esc(a)}</div>`;
 }
 
 // ---------- boot ----------

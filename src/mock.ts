@@ -1,7 +1,7 @@
 // Mock engine: lets the full UI be demoed without a Firebase project or Gemini Nano.
 // Scores with the same local rules; clearly labelled "MOCK" in the UI.
-import type { Engine, CheckInput, OnDeviceStatus } from './engine.ts';
-import type { CheckResult, Source, Verdict } from './types.ts';
+import type { Engine, CheckInput, FollowUpChat, FollowUpContext, OnDeviceStatus } from './engine.ts';
+import type { CheckResult, Source } from './types.ts';
 import { rulesVerdict } from './rules.ts';
 import { t } from './i18n.ts';
 
@@ -14,6 +14,10 @@ export class MockEngine implements Engine {
   status: OnDeviceStatus = 'available';
   /** Simulated network state. */
   offline = false;
+  /** Why the app is in mock mode (shown in the banner). Empty when mock mode was asked for with ?mock. */
+  reason = '';
+  /** Makes the next model calls throw this error (tests, and checking the fallback UI). */
+  failWith?: Error;
 
   /** `delayScale: 0` removes the simulated latency (tests). */
   private delayScale: number;
@@ -30,7 +34,10 @@ export class MockEngine implements Engine {
   private async run(input: CheckInput, source: Source, outLang: string): Promise<CheckResult> {
     const t0 = performance.now();
     await sleep((source === 'mock_in_cloud' ? 900 : 450) * this.delayScale);
-    return { verdict: rulesVerdict(input.signals, outLang), source, sentText: input.text, ms: Math.round(performance.now() - t0) };
+    if (this.failWith) throw this.failWith;
+    // Local rules can't read pixels; never pretend a screenshot "looks OK".
+    if (!input.text && input.image) throw new Error('mock mode cannot read screenshots');
+    return { verdict: rulesVerdict(input.signals, outLang), source, sentText: input.text, ms: Math.round(performance.now() - t0), lang: outLang };
   }
 
   async privateCheck(input: CheckInput) {
@@ -48,9 +55,19 @@ export class MockEngine implements Engine {
     return this.run(input, 'mock_in_cloud', input.outLang);
   }
 
-  async followUp(_maskedMessage: string, v: Verdict, question: string, uiLang: string) {
-    if (this.offline || browserOffline()) throw new Error('offline');
-    await sleep(700 * this.delayScale);
-    return t(uiLang, 'mock.followup').replace('{q}', question).replace('{score}', String(v.risk_score));
+  startFollowUp({ verdict, uiLang }: FollowUpContext): FollowUpChat & { history: string[] } {
+    const history: string[] = [];
+    return {
+      history,
+      ask: async (question: string) => {
+        if (this.offline || browserOffline()) throw new Error('offline');
+        await sleep(700 * this.delayScale);
+        history.push(question);
+        return t(uiLang, 'mock.followup')
+          .replace('{q}', question)
+          .replace('{score}', String(verdict.risk_score))
+          .replace('{n}', String(history.length));
+      },
+    };
   }
 }

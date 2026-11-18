@@ -49,7 +49,7 @@ test('simulated offline blocks every cloud call', async () => {
   const v = (await engine().privateCheck(inputFor('hello'))).verdict;
   await assert.rejects(e.cloudCheck(inputFor('hello')), /offline/);
   await assert.rejects(e.hybridCheck(inputFor('hello')), /offline/);
-  await assert.rejects(e.followUp('m', v, 'q', 'en'), /offline/);
+  await assert.rejects(e.startFollowUp({ maskedMessage: 'm', verdict: v, uiLang: 'en' }).ask('q'), /offline/);
 });
 
 test('download reports progress and makes the model available', async () => {
@@ -64,8 +64,22 @@ test('download reports progress and makes the model available', async () => {
 
 test('follow-up answer is labelled as a mock and echoes the question', async () => {
   const v = (await engine().privateCheck(inputFor(OTP))).verdict;
-  const a = await engine().followUp('masked', v, 'How do I report this?', 'en');
+  const a = await engine().startFollowUp({ maskedMessage: 'masked', verdict: v, uiLang: 'en' }).ask('How do I report this?');
   assert.match(a, /Mock answer/);
   assert.match(a, /How do I report this\?/);
   assert.ok(a.includes(`${v.risk_score}/100`));
+});
+
+test('one follow-up chat keeps its history across questions', async () => {
+  const v = (await engine().privateCheck(inputFor(OTP))).verdict;
+  const chat = engine().startFollowUp({ maskedMessage: 'masked', verdict: v, uiLang: 'en' });
+  await chat.ask('Is it a scam?');
+  const second = await chat.ask('Who do I call?');
+  assert.deepEqual(chat.history, ['Is it a scam?', 'Who do I call?']);
+  assert.match(second, /question 2/);
+});
+
+test('results record the language their text is written in', async () => {
+  assert.equal((await engine().privateCheck(inputFor(OTP, 'ko'))).lang, 'en');
+  assert.equal((await engine().cloudCheck(inputFor(OTP, 'ko'))).lang, 'ko');
 });

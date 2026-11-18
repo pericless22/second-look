@@ -25,4 +25,6 @@ export interface CheckResult {
   source: Source;
   sentText: string; // exactly what the model saw
   ms: number;
+  /** Language the reasons and actions are written in. */
+  lang?: string;
 }

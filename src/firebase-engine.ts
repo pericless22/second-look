@@ -6,16 +6,14 @@ import {
   getAI, getGenerativeModel, GoogleAIBackend, InferenceMode, Schema,
   type GenerativeModel, type Part,
 } from 'firebase/ai';
-import type { Engine, CheckInput, OnDeviceStatus } from './engine.ts';
-import { buildPrompt, normalizeVerdict, VERDICT_JSON_SCHEMA } from './engine.ts';
+import type { Engine, CheckInput, FollowUpChat, FollowUpContext, OnDeviceStatus } from './engine.ts';
+import { buildPrompt, followUpInstruction, normalizeVerdict, stripMarkers, VERDICT_JSON_SCHEMA } from './engine.ts';
 import { applyLocalFloor } from './rules.ts';
-import { RISK_LEVELS, SCAM_TYPES, type CheckResult, type Source, type Verdict } from './types.ts';
+import { appCheckPlan, isRealValue, type AppConfig } from './config.ts';
+import { RISK_LEVELS, SCAM_TYPES, type CheckResult, type Source } from './types.ts';
 
-export interface AppConfig {
-  firebase: FirebaseOptions;
-  appCheck?: { recaptchaV3SiteKey?: string; useDebugToken?: boolean };
-  models?: { cloudModel?: string };
-}
+export const DEFAULT_CLOUD_MODEL = 'gemini-3.5-flash-lite';
+const looksLikeMissingModel = (e: unknown) => /\b404\b|not found|is not supported/i.test(e instanceof Error ? e.message : String(e));
 
 const CLOUD_SCHEMA = Schema.object({
   properties: {
@@ -34,25 +32,27 @@ export class FirebaseEngine implements Engine {
   private cloudModelName: string;
   private cache = new Map<string, GenerativeModel>();
 
-  constructor(private cfg: AppConfig) {
-    const app = initializeApp(cfg.firebase);
-    // App Check is required by Firebase AI Logic. Debug tokens are accepted for hackathon judging;
-    // the token is printed to the console and must be registered in the Firebase console (never committed).
-    if (cfg.appCheck?.useDebugToken) (self as any).FIREBASE_APPCHECK_DEBUG_TOKEN = true;
-    if (cfg.appCheck?.recaptchaV3SiteKey) {
-      initializeAppCheck(app, { provider: new ReCaptchaV3Provider(cfg.appCheck.recaptchaV3SiteKey), isTokenAutoRefreshEnabled: true });
+  constructor(cfg: AppConfig) {
+    const app = initializeApp(cfg.firebase as FirebaseOptions);
+    // Firebase AI Logic expects App Check. The hosted site uses reCAPTCHA v3; local runs against your own
+    // project can use a debug token (printed in the console, registered in the Firebase console, never committed).
+    const plan = appCheckPlan(cfg, location.hostname);
+    for (const w of plan.warnings) console.warn(`[Second Look] ${w}`);
+    if (plan.siteKey) {
+      if (plan.debugToken) (self as any).FIREBASE_APPCHECK_DEBUG_TOKEN = true;
+      initializeAppCheck(app, { provider: new ReCaptchaV3Provider(plan.siteKey), isTokenAutoRefreshEnabled: true });
     }
     this.ai = getAI(app, { backend: new GoogleAIBackend() });
-    this.cloudModelName = cfg.models?.cloudModel ?? 'gemini-3.5-flash-lite';
-    // Remote Config lets us swap the cloud model / thresholds without redeploying.
+    this.cloudModelName = isRealValue(cfg.models?.cloudModel) ? cfg.models.cloudModel : DEFAULT_CLOUD_MODEL;
+    // Remote Config can swap the cloud model without a redeploy. A bad value falls back to the default (see run()).
     try {
       const rc = getRemoteConfig(app);
       rc.defaultConfig = { cloud_model: this.cloudModelName };
       fetchAndActivate(rc).then(() => {
-        const m = getValue(rc, 'cloud_model').asString();
+        const m = getValue(rc, 'cloud_model').asString().trim();
         if (m && m !== this.cloudModelName) { this.cloudModelName = m; this.cache.clear(); }
       }).catch(() => {});
-    } catch { /* Remote Config optional */ }
+    } catch { /* Remote Config is optional */ }
   }
 
   private onDeviceOpts(lang: string, withImage: boolean) {
@@ -102,11 +102,21 @@ export class FirebaseEngine implements Engine {
     const t0 = performance.now();
     const parts: (string | Part)[] = [buildPrompt(input, outLang, masked)];
     if (input.image) parts.push({ type: 'inlineData', inlineData: { mimeType: input.image.mimeType, data: input.image.base64 } });
-    const res = await this.model(mode, input.lang, !!input.image).generateContent(parts);
+    let res;
+    try {
+      res = await this.model(mode, input.lang, !!input.image).generateContent(parts);
+    } catch (e) {
+      // A mistyped Remote Config model name would otherwise break every cloud call.
+      if (mode === InferenceMode.ONLY_ON_DEVICE || this.cloudModelName === DEFAULT_CLOUD_MODEL || !looksLikeMissingModel(e)) throw e;
+      console.warn(`[Second Look] Cloud model "${this.cloudModelName}" failed, retrying with ${DEFAULT_CLOUD_MODEL}.`, e);
+      this.cloudModelName = DEFAULT_CLOUD_MODEL;
+      this.cache.clear();
+      res = await this.model(mode, input.lang, !!input.image).generateContent(parts);
+    }
     const source: Source = res.response.inferenceSource === 'on_device' ? 'on_device' : 'in_cloud';
-    // Local critical signals (e.g. a request to forward a verification code) act as a floor under the model.
+    // Local rules act as a floor under the model (critical signals, and strong rule evidence vs. a "low" answer).
     const verdict = applyLocalFloor(normalizeVerdict(res.response.text()), input.signals, outLang);
-    return { verdict, source, sentText: input.text, ms: Math.round(performance.now() - t0) };
+    return { verdict, source, sentText: input.text, ms: Math.round(performance.now() - t0), lang: outLang };
   }
 
   // The on-device model only writes English for now, so paths that may run on-device ask for English.
@@ -114,15 +124,17 @@ export class FirebaseEngine implements Engine {
   hybridCheck(input: CheckInput) { return this.run(InferenceMode.PREFER_ON_DEVICE, input, 'en', true); }
   cloudCheck(input: CheckInput) { return this.run(InferenceMode.ONLY_IN_CLOUD, input, input.outLang, true); }
 
-  async followUp(maskedMessage: string, v: Verdict, question: string, uiLang: string) {
-    const chat = getGenerativeModel(this.ai, { mode: InferenceMode.ONLY_IN_CLOUD, inCloudParams: { model: this.cloudModelName } })
-      .startChat({
-        history: [
-          { role: 'user', parts: [{ type: 'text', text: `Masked message I received:\n${maskedMessage}` }] },
-          { role: 'model', parts: [{ type: 'text', text: `Assessment: ${JSON.stringify(v)}` }] },
-        ],
-      });
-    const r = await chat.sendMessage(`${question}\n(Answer briefly in ${uiLang === 'ko' ? 'Korean' : 'English'}. Never ask for personal data.)`);
-    return r.response.text();
+  /** One ChatSession per result: the SDK keeps the history, so follow-ups really are multi-turn. */
+  startFollowUp({ maskedMessage, verdict, uiLang }: FollowUpContext): FollowUpChat {
+    const chat = getGenerativeModel(this.ai, {
+      mode: InferenceMode.ONLY_IN_CLOUD,
+      inCloudParams: { model: this.cloudModelName, systemInstruction: followUpInstruction(uiLang), generationConfig: { temperature: 0.3 } },
+    }).startChat({
+      history: [
+        { role: 'user', parts: [{ type: 'text', text: `Masked message I received:\n--- MESSAGE START ---\n${stripMarkers(maskedMessage) || '(screenshot only)'}\n--- MESSAGE END ---` }] },
+        { role: 'model', parts: [{ type: 'text', text: `My assessment: ${JSON.stringify(verdict)}` }] },
+      ],
+    });
+    return { ask: async (question: string) => (await chat.sendMessage(question)).response.text() };
   }
 }
